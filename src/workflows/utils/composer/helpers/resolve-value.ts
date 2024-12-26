@@ -1,26 +1,30 @@
-import { OrchestrationUtils, promiseAll } from '../../../../utils'
+import { deepCopy, OrchestrationUtils, promiseAll } from '../../../../utils'
 
 async function resolveProperty(property, transactionContext) {
   const { invoke: invokeRes } = transactionContext
 
-  if (property?.__type === OrchestrationUtils.SymbolInputReference) {
-    return transactionContext.payload
-  } else if (property?.__type === OrchestrationUtils.SymbolWorkflowStepTransformer) {
-    return await property.__resolver(transactionContext)
-  } else if (property?.__type === OrchestrationUtils.SymbolWorkflowHook) {
-    return await property.__value(transactionContext)
-  } else if (property?.__type === OrchestrationUtils.SymbolWorkflowStep) {
-    const output = invokeRes[property.__step__]?.output
-    if (output?.__type === OrchestrationUtils.SymbolWorkflowStepResponse) {
-      return output.output
-    }
+  let res
 
-    return output
+  if (property?.__type === OrchestrationUtils.SymbolInputReference) {
+    res = transactionContext.payload
+  } else if (property?.__type === OrchestrationUtils.SymbolMedusaWorkflowResponse) {
+    res = await resolveValue(property.$result, transactionContext)
+  } else if (property?.__type === OrchestrationUtils.SymbolWorkflowStepTransformer) {
+    res = await property.__resolver(transactionContext)
+  } else if (property?.__type === OrchestrationUtils.SymbolWorkflowStep) {
+    const output = invokeRes[property.__step__]?.output ?? invokeRes[property.__step__]
+    if (output?.__type === OrchestrationUtils.SymbolWorkflowStepResponse) {
+      res = output.output
+    } else {
+      res = output
+    }
   } else if (property?.__type === OrchestrationUtils.SymbolWorkflowStepResponse) {
-    return property.output
+    res = property.output
   } else {
-    return property
+    res = property
   }
+
+  return res
 }
 
 /**
@@ -41,19 +45,22 @@ export async function resolveValue(input, transactionContext) {
     }
 
     for (const key of Object.keys(inputTOUnwrap)) {
-      parentRef[key] = await resolveProperty(inputTOUnwrap[key], transactionContext)
+      parentRef[key] = deepCopy(await resolveProperty(inputTOUnwrap[key], transactionContext))
 
       if (typeof parentRef[key] === 'object') {
-        await unwrapInput(parentRef[key], parentRef[key])
+        parentRef[key] = await unwrapInput(parentRef[key], parentRef[key])
       }
     }
 
     return parentRef
   }
 
-  const result = input?.__type
-    ? await resolveProperty(input, transactionContext)
-    : await unwrapInput(input, {})
+  const copiedInput =
+    input?.__type === OrchestrationUtils.SymbolWorkflowWorkflowData ? input.output : input
+
+  const result = copiedInput?.__type
+    ? await resolveProperty(copiedInput, transactionContext)
+    : await unwrapInput(copiedInput, {})
 
   return result && JSON.parse(JSON.stringify(result))
 }

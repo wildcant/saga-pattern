@@ -1,16 +1,24 @@
-import { DistributedTransaction, TransactionPayload } from './distributed-transaction'
+import {
+  DistributedTransaction,
+  DistributedTransactionType,
+  TransactionPayload,
+} from './distributed-transaction'
+import { TransactionOrchestrator } from './transaction-orchestrator'
 import {
   TransactionHandlerType,
   TransactionState,
   TransactionStepsDefinition,
   TransactionStepStatus,
+  TransactionStepState,
 } from './types'
 
 export type TransactionStepHandler = (
   actionId: string,
   handlerType: TransactionHandlerType,
   payload: TransactionPayload,
-  transaction?: DistributedTransaction,
+  transaction: DistributedTransactionType,
+  step: TransactionStep,
+  orchestrator: TransactionOrchestrator,
 ) => Promise<unknown>
 
 /**
@@ -34,14 +42,15 @@ export class TransactionStep {
    */
   private stepFailed = false
   id: string
+  uuid?: string
   depth: number
   definition: TransactionStepsDefinition
   invoke: {
-    state: TransactionState
+    state: TransactionStepState
     status: TransactionStepStatus
   }
   compensate: {
-    state: TransactionState
+    state: TransactionStepState
     status: TransactionStepStatus
   }
   attempts: number
@@ -77,18 +86,27 @@ export class TransactionStep {
     return !this.stepFailed
   }
 
-  public changeState(toState: TransactionState) {
+  public changeState(toState: TransactionStepState) {
     const allowed = {
-      [TransactionState.DORMANT]: [TransactionState.NOT_STARTED],
-      [TransactionState.NOT_STARTED]: [
-        TransactionState.INVOKING,
-        TransactionState.COMPENSATING,
-        TransactionState.FAILED,
-        TransactionState.SKIPPED,
+      [TransactionStepState.DORMANT]: [TransactionStepState.NOT_STARTED],
+      [TransactionStepState.NOT_STARTED]: [
+        TransactionStepState.INVOKING,
+        TransactionStepState.COMPENSATING,
+        TransactionStepState.FAILED,
+        TransactionStepState.SKIPPED,
+        TransactionStepState.SKIPPED_FAILURE,
       ],
-      [TransactionState.INVOKING]: [TransactionState.FAILED, TransactionState.DONE],
-      [TransactionState.COMPENSATING]: [TransactionState.REVERTED, TransactionState.FAILED],
-      [TransactionState.DONE]: [TransactionState.COMPENSATING],
+      [TransactionStepState.INVOKING]: [
+        TransactionStepState.FAILED,
+        TransactionStepState.DONE,
+        TransactionStepState.TIMEOUT,
+        TransactionStepState.SKIPPED,
+      ],
+      [TransactionStepState.COMPENSATING]: [
+        TransactionStepState.REVERTED,
+        TransactionStepState.FAILED,
+      ],
+      [TransactionStepState.DONE]: [TransactionStepState.COMPENSATING],
     }
 
     const curState = this.getStates()
@@ -136,10 +154,10 @@ export class TransactionStep {
   }
 
   hasTimeout(): boolean {
-    return !!this.definition.timeout
+    return !!this.getTimeout()
   }
 
-  getTimeoutInterval(): number | undefined {
+  getTimeout(): number | undefined {
     return this.definition.timeout
   }
 
@@ -170,7 +188,7 @@ export class TransactionStep {
     const { status, state } = this.getStates()
     return (
       (!this.isCompensating() &&
-        state === TransactionState.NOT_STARTED &&
+        state === TransactionStepState.NOT_STARTED &&
         flowState === TransactionState.INVOKING) ||
       status === TransactionStepStatus.TEMPORARY_FAILURE
     )
@@ -179,7 +197,7 @@ export class TransactionStep {
   canCompensate(flowState: TransactionState): boolean {
     return (
       this.isCompensating() &&
-      this.getStates().state === TransactionState.NOT_STARTED &&
+      this.getStates().state === TransactionStepState.NOT_STARTED &&
       flowState === TransactionState.COMPENSATING
     )
   }

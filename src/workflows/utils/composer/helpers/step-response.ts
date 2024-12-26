@@ -1,5 +1,5 @@
-import { PermanentStepFailureError } from '../../../../orchestrator'
-import { OrchestrationUtils } from '../../../../utils'
+import { PermanentStepFailureError, SkipStepResponse } from '../../../../orchestrator'
+import { OrchestrationUtils, isDefined } from '../../../../utils'
 
 /**
  * This class is used to create the response returned by a step. A step return its data by returning an instance of `StepResponse`.
@@ -26,13 +26,15 @@ export class StepResponse<TOutput, TCompensateInput = TOutput> {
     /**
      * The output of the step.
      */
-    output: TOutput,
+    output?: TOutput,
     /**
      * The input to be passed as a parameter to the step's compensation function. If not provided, the `output` will be provided instead.
      */
     compensateInput?: TCompensateInput,
   ) {
-    this.#output = output
+    if (isDefined(output)) {
+      this.#output = output
+    }
     this.#compensateInput = (compensateInput ?? output) as TCompensateInput
   }
 
@@ -41,8 +43,13 @@ export class StepResponse<TOutput, TCompensateInput = TOutput> {
    *
    * @param message - An optional message to be logged.
    */
-  static permanentFailure(message = 'Permanent failure'): never {
-    throw new PermanentStepFailureError(message)
+  static permanentFailure(message = 'Permanent failure', compensateInput?: unknown): never {
+    const response = isDefined(compensateInput) ? new StepResponse(compensateInput) : undefined
+    throw new PermanentStepFailureError(message, response)
+  }
+
+  static skip(): SkipStepResponse {
+    return new SkipStepResponse()
   }
 
   /**

@@ -1,4 +1,4 @@
-import { OrchestratorBuilder } from '../orchestrator'
+import { OrchestratorBuilder } from '../orchestrator/transaction'
 
 describe('OrchestratorBuilder', () => {
   let builder: OrchestratorBuilder

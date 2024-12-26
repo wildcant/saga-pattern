@@ -1,44 +1,55 @@
-export class PermanentStepFailureError extends Error {
-  static isPermanentStepFailureError(
-    error: Error
-  ): error is PermanentStepFailureError {
-    return (
-      error instanceof PermanentStepFailureError ||
-      error.name === "PermanentStepFailure"
-    )
+class BaseStepErrror extends Error {
+  #stepResponse: unknown
+
+  constructor(name, message?: string, stepResponse?: unknown) {
+    super(message)
+    this.name = name
+    this.#stepResponse = stepResponse
   }
 
-  constructor(message?: string) {
-    super(message)
-    this.name = "PermanentStepFailure"
+  getStepResponse(): unknown {
+    return this.#stepResponse
   }
 }
 
-export class StepTimeoutError extends Error {
-  static isStepTimeoutError(error: Error): error is StepTimeoutError {
-    return (
-      error instanceof StepTimeoutError || error.name === "StepTimeoutError"
-    )
+export class PermanentStepFailureError extends BaseStepErrror {
+  static isPermanentStepFailureError(error: Error): error is PermanentStepFailureError {
+    return error instanceof PermanentStepFailureError || error?.name === 'PermanentStepFailure'
   }
 
-  constructor(message?: string) {
-    super(message)
-    this.name = "StepTimeoutError"
+  constructor(message?: string, stepResponse?: unknown) {
+    super('PermanentStepFailure', message, stepResponse)
   }
 }
 
-export class TransactionTimeoutError extends Error {
-  static isTransactionTimeoutError(
-    error: Error
-  ): error is TransactionTimeoutError {
+export class SkipStepResponse extends BaseStepErrror {
+  static isSkipStepResponse(error: Error): error is SkipStepResponse {
+    return error instanceof SkipStepResponse || error?.name === 'SkipStepResponse'
+  }
+
+  constructor(message?: string, stepResponse?: unknown) {
+    super('SkipStepResponse', message, stepResponse)
+  }
+}
+
+export class TransactionStepTimeoutError extends BaseStepErrror {
+  static isTransactionStepTimeoutError(error: Error): error is TransactionStepTimeoutError {
     return (
-      error instanceof TransactionTimeoutError ||
-      error.name === "TransactionTimeoutError"
+      error instanceof TransactionStepTimeoutError || error?.name === 'TransactionStepTimeoutError'
     )
   }
 
-  constructor(message?: string) {
-    super(message)
-    this.name = "TransactionTimeoutError"
+  constructor(message?: string, stepResponse?: unknown) {
+    super('TransactionStepTimeoutError', message, stepResponse)
+  }
+}
+
+export class TransactionTimeoutError extends BaseStepErrror {
+  static isTransactionTimeoutError(error: Error): error is TransactionTimeoutError {
+    return error instanceof TransactionTimeoutError || error?.name === 'TransactionTimeoutError'
+  }
+
+  constructor(message?: string, stepResponse?: unknown) {
+    super('TransactionTimeoutError', message, stepResponse)
   }
 }

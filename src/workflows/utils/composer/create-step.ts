@@ -1,6 +1,13 @@
-import { TransactionStepsDefinition } from '../../../orchestrator'
+import {
+  TransactionStepsDefinition,
+  WorkflowManager,
+  WorkflowStepHandler,
+  WorkflowStepHandlerArguments,
+} from '../../../orchestrator'
 import { isString, OrchestrationUtils } from '../../../utils'
+import { ulid } from 'ulid'
 import { resolveValue, StepResponse } from './helpers'
+import { createStepHandler } from './helpers/create-step-handler'
 import { proxify } from './helpers/proxy'
 import {
   CreateWorkflowComposerContext,
@@ -19,7 +26,7 @@ import {
  *
  * @returns The expected output based on the type parameter `TOutput`.
  */
-type InvokeFn<TInput, TOutput, TCompensateInput> = (
+export type InvokeFn<TInput, TOutput, TCompensateInput> = (
   /**
    * The input of the step.
    */
@@ -44,7 +51,7 @@ type InvokeFn<TInput, TOutput, TCompensateInput> = (
  *
  * @returns There's no expected type to be returned by the compensation function.
  */
-type CompensateFn<T> = (
+export type CompensateFn<T> = (
   /**
    * The argument passed to the compensation function.
    */
@@ -55,7 +62,12 @@ type CompensateFn<T> = (
   context: StepExecutionContext,
 ) => unknown | Promise<unknown>
 
-interface ApplyStepOptions<
+export type LocalStepConfig = { name?: string } & Omit<
+  TransactionStepsDefinition,
+  'next' | 'uuid' | 'action'
+>
+
+export interface ApplyStepOptions<
   TStepInputs extends {
     [K in keyof TInvokeInput]: WorkflowData<TInvokeInput[K]>
   },
@@ -82,7 +94,7 @@ interface ApplyStepOptions<
  * @param invokeFn
  * @param compensateFn
  */
-function applyStep<
+export function applyStep<
   TInvokeInput,
   TStepInput extends {
     [K in keyof TInvokeInput]: WorkflowData<TInvokeInput[K]>
@@ -106,68 +118,182 @@ function applyStep<
       throw new Error('createStep must be used inside a createWorkflow definition')
     }
 
-    const handler = {
-      invoke: async transactionContext => {
-        const executionContext: StepExecutionContext = {
-          metadata: transactionContext.metadata,
-        }
+    const handler = createStepHandler.bind(this)({
+      stepName,
+      input,
+      invokeFn,
+      compensateFn,
+    })
 
-        const argInput = input ? await resolveValue(input, transactionContext) : {}
-        const stepResponse: StepResponse<any, any> = await invokeFn.apply(this, [
-          argInput,
-          executionContext,
-        ])
+    wrapAsyncHandler(stepConfig, handler)
 
-        const stepResponseJSON =
-          stepResponse?.__type === OrchestrationUtils.SymbolWorkflowStepResponse
-            ? stepResponse.toJSON()
-            : stepResponse
-
-        return {
-          __type: OrchestrationUtils.SymbolWorkflowWorkflowData,
-          output: stepResponseJSON,
-        }
-      },
-      compensate: compensateFn
-        ? async transactionContext => {
-            const executionContext: StepExecutionContext = {
-              metadata: transactionContext.metadata,
-            }
-
-            const stepOutput = transactionContext.invoke[stepName]?.output
-            const invokeResult =
-              stepOutput?.__type === OrchestrationUtils.SymbolWorkflowStepResponse
-                ? stepOutput.compensateInput &&
-                  JSON.parse(JSON.stringify(stepOutput.compensateInput))
-                : stepOutput && JSON.parse(JSON.stringify(stepOutput))
-
-            const args = [invokeResult, executionContext]
-            const output = await compensateFn.apply(this, args)
-            return {
-              output,
-            }
-          }
-        : undefined,
-    }
-
-    stepConfig!.noCompensation = !compensateFn
+    stepConfig.uuid = ulid()
+    stepConfig.noCompensation = !compensateFn
 
     this.flow.addAction(stepName, stepConfig)
-    this.handlers.set(stepName, handler)
+
+    this.isAsync ||= !!(stepConfig.async || stepConfig.compensateAsync)
+
+    if (!this.handlers.has(stepName)) {
+      this.handlers.set(stepName, handler)
+    }
 
     const ret = {
       __type: OrchestrationUtils.SymbolWorkflowStep,
       __step__: stepName,
-      config: (config: Pick<TransactionStepsDefinition, 'maxRetries'>) => {
-        this.flow.replaceAction(stepName, stepName, {
-          ...stepConfig,
-          ...config,
-        })
-        return proxify(ret)
-      },
     }
 
-    return proxify(ret)
+    const refRet = proxify(ret) as WorkflowData<TInvokeResultOutput> & {
+      if: (
+        input: any,
+        condition: (...args: any) => boolean | WorkflowData,
+      ) => WorkflowData<TInvokeResultOutput>
+    }
+
+    refRet.config = (
+      localConfig: { name?: string } & Omit<TransactionStepsDefinition, 'next' | 'uuid' | 'action'>,
+    ) => {
+      const newStepName = localConfig.name ?? stepName
+      const newConfig = {
+        async: false,
+        compensateAsync: false,
+        ...stepConfig,
+        ...localConfig,
+      }
+
+      delete localConfig.name
+
+      const handler = createStepHandler.bind(this)({
+        stepName: newStepName,
+        input,
+        invokeFn,
+        compensateFn,
+      })
+
+      wrapAsyncHandler(stepConfig, handler)
+
+      this.handlers.set(newStepName, handler)
+
+      this.flow.replaceAction(stepConfig.uuid!, newStepName, newConfig)
+      this.isAsync ||= !!(newConfig.async || newConfig.compensateAsync)
+
+      ret.__step__ = newStepName
+      WorkflowManager.update(this.workflowId, this.flow, this.handlers)
+
+      //const confRef = proxify(ret)
+
+      if (global[OrchestrationUtils.SymbolMedusaWorkflowComposerCondition]) {
+        const flagSteps = global[OrchestrationUtils.SymbolMedusaWorkflowComposerCondition].steps
+
+        const idx = flagSteps.findIndex(a => a.__step__ === ret.__step__)
+        if (idx > -1) {
+          flagSteps.splice(idx, 1)
+        }
+        flagSteps.push(refRet)
+      }
+
+      return refRet
+    }
+    refRet.if = (
+      input: any,
+      condition: (...args: any) => boolean | WorkflowData,
+    ): WorkflowData<TInvokeResultOutput> => {
+      if (typeof condition !== 'function') {
+        throw new Error('Condition must be a function')
+      }
+
+      wrapConditionalStep(input, condition, handler)
+      this.handlers.set(ret.__step__, handler)
+
+      return refRet
+    }
+
+    if (global[OrchestrationUtils.SymbolMedusaWorkflowComposerCondition]) {
+      global[OrchestrationUtils.SymbolMedusaWorkflowComposerCondition].steps.push(refRet)
+    }
+
+    return refRet
+  }
+}
+
+/**
+ * @internal
+ *
+ * Internal function to handle async steps to be automatically marked as completed after they are executed.
+ *
+ * @param stepConfig
+ * @param handle
+ */
+function wrapAsyncHandler(
+  stepConfig: TransactionStepsDefinition,
+  handle: {
+    invoke: WorkflowStepHandler
+    compensate?: WorkflowStepHandler
+  },
+) {
+  if (stepConfig.async) {
+    if (typeof handle.invoke === 'function') {
+      const originalInvoke = handle.invoke
+
+      handle.invoke = async (stepArguments: WorkflowStepHandlerArguments) => {
+        const response = (await originalInvoke(stepArguments)) as any
+        if (response?.output?.__type !== OrchestrationUtils.SymbolWorkflowStepResponse) {
+          return
+        }
+
+        stepArguments.step.definition.backgroundExecution = true
+        return response
+      }
+    }
+  }
+
+  if (stepConfig.compensateAsync) {
+    if (typeof handle.compensate === 'function') {
+      const originalCompensate = handle.compensate!
+      handle.compensate = async (stepArguments: WorkflowStepHandlerArguments) => {
+        const response = (await originalCompensate(stepArguments)) as any
+
+        if (response?.output?.__type !== OrchestrationUtils.SymbolWorkflowStepResponse) {
+          return
+        }
+        stepArguments.step.definition.backgroundExecution = true
+
+        return response
+      }
+    }
+  }
+}
+
+/**
+ * @internal
+ *
+ * Internal function to handle conditional steps.
+ *
+ * @param condition
+ * @param handle
+ */
+function wrapConditionalStep(
+  input: any,
+  condition: (...args: any) => boolean | WorkflowData,
+  handle: {
+    invoke: WorkflowStepHandler
+    compensate?: WorkflowStepHandler
+  },
+) {
+  const originalInvoke = handle.invoke
+  handle.invoke = async (stepArguments: WorkflowStepHandlerArguments) => {
+    const args = await resolveValue(input, stepArguments)
+    const canContinue = await condition(args, stepArguments)
+
+    if (stepArguments.step.definition?.async) {
+      stepArguments.step.definition.backgroundExecution = true
+    }
+
+    if (!canContinue) {
+      return StepResponse.skip()
+    }
+
+    return await originalInvoke(stepArguments)
   }
 }
 
@@ -179,13 +305,14 @@ function applyStep<
  * @typeParam TInvokeResultCompensateInput - The type of the expected input parameter to the compensation function.
  *
  * @returns A step function to be used in a workflow.
- *
  */
 export function createStep<TInvokeInput, TInvokeResultOutput, TInvokeResultCompensateInput>(
   /**
-   * The name of the step or its configuration (currently support maxRetries).
+   * The name of the step or its configuration.
    */
-  nameOrConfig: string | ({ name: string } & Pick<TransactionStepsDefinition, 'maxRetries'>),
+  nameOrConfig:
+    | string
+    | ({ name: string } & Omit<TransactionStepsDefinition, 'next' | 'uuid' | 'action'>),
   /**
    * An invocation function that will be executed when the workflow is executed. The function must return an instance of {@link StepResponse}. The constructor of {@link StepResponse}
    * accepts the output of the step as a first argument, and optionally as a second argument the data to be passed to the compensation function as a parameter.
@@ -209,17 +336,15 @@ export function createStep<TInvokeInput, TInvokeResultOutput, TInvokeResultCompe
         }
       | undefined,
   ): WorkflowData<TInvokeResultOutput> {
-    if (!global[OrchestrationUtils.SymbolMedusaWorkflowComposerContext]) {
+    const context = global[
+      OrchestrationUtils.SymbolMedusaWorkflowComposerContext
+    ] as CreateWorkflowComposerContext
+
+    if (!context) {
       throw new Error('createStep must be used inside a createWorkflow definition')
     }
 
-    const stepBinder = (
-      global[
-        OrchestrationUtils.SymbolMedusaWorkflowComposerContext
-      ] as CreateWorkflowComposerContext
-    ).stepBinder
-
-    return stepBinder<TInvokeResultOutput>(
+    return context.stepBinder<TInvokeResultOutput>(
       applyStep<
         TInvokeInput,
         { [K in keyof TInvokeInput]: WorkflowData<TInvokeInput[K]> },

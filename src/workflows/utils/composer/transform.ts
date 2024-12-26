@@ -1,7 +1,9 @@
-import { resolveValue } from './helpers'
-import { StepExecutionContext, WorkflowData } from './type'
-import { proxify } from './helpers/proxy'
+import { ulid } from 'ulid'
+import { TransactionContext, WorkflowStepHandlerArguments } from '../../../orchestrator'
 import { OrchestrationUtils } from '../../../utils'
+import { resolveValue } from './helpers'
+import { proxify } from './helpers/proxy'
+import { StepExecutionContext, WorkflowData } from './type'
 
 type Func1<T extends object | WorkflowData, U> = (
   input: T extends WorkflowData<infer U>
@@ -26,6 +28,32 @@ type Func<T, U> = (input: T, context: StepExecutionContext) => U | Promise<U>
  * If you're also retrieving the output of a hook and want to check if its value is set, you must use a workflow to get the runtime value of that hook.
  *
  * @returns There's no expected value to be returned by the `transform` function.
+ *
+ * @example
+ * import {
+ *   createWorkflow,
+ *   transform,
+ *   WorkflowResponse
+ * } from "@medusajs/framework/workflows-sdk"
+ * import { step1, step2 } from "./steps"
+ *
+ * type WorkflowInput = {
+ *   name: string
+ * }
+ *
+ * const myWorkflow = createWorkflow(
+ *   "hello-world",
+ *   (input: WorkflowInput) => {
+ *     const str1 = step1(input)
+ *     const str2 = step2(input)
+ *
+ *     const message = transform({
+ *       str1,
+ *       str2
+ *     }, (input) => `${input.str1}${input.str2}`)
+ *
+ *     return new WorkflowResponse(message)
+ * })
  */
 // prettier-ignore
 // eslint-disable-next-line max-len
@@ -129,14 +157,26 @@ export function transform<T extends object | WorkflowData, RA, RB, RC, RD, RE, R
 ): WorkflowData<RFinal>
 
 export function transform(values: any | any[], ...functions: Function[]): unknown {
+  const uniqId = ulid()
+
   const ret = {
+    __id: uniqId,
     __type: OrchestrationUtils.SymbolWorkflowStepTransformer,
-    __resolver: undefined,
   }
 
-  const returnFn = async function (transactionContext): Promise<any> {
-    const allValues = await resolveValue(values, transactionContext)
-    const stepValue = allValues ? JSON.parse(JSON.stringify(allValues)) : allValues
+  const returnFn = async function (
+    // If a transformer is returned as the result of a workflow, then at this point the workflow is entirely done, in that case we have a TransactionContext
+    transactionContext: WorkflowStepHandlerArguments | TransactionContext,
+  ): Promise<any> {
+    if ('transaction' in transactionContext) {
+      const temporaryDataKey = `${transactionContext.transaction.modelId}_${transactionContext.transaction.transactionId}_${uniqId}`
+
+      if (transactionContext.transaction.hasTemporaryData(temporaryDataKey)) {
+        return transactionContext.transaction.getTemporaryData(temporaryDataKey)
+      }
+    }
+
+    const stepValue = await resolveValue(values, transactionContext)
 
     let finalResult
     for (let i = 0; i < functions.length; i++) {
@@ -144,6 +184,12 @@ export function transform(values: any | any[], ...functions: Function[]): unknow
       const arg = i === 0 ? stepValue : finalResult
 
       finalResult = await fn.apply(fn, [arg, transactionContext])
+    }
+
+    if ('transaction' in transactionContext) {
+      const temporaryDataKey = `${transactionContext.transaction.modelId}_${transactionContext.transaction.transactionId}_${uniqId}`
+
+      transactionContext.transaction.setTemporaryData(temporaryDataKey, finalResult)
     }
 
     return finalResult

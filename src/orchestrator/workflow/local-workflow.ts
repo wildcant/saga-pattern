@@ -1,7 +1,10 @@
+import { isString } from '../../utils'
+import { Context } from '../../utils/types'
 import {
-  DistributedTransaction,
   DistributedTransactionEvent,
   DistributedTransactionEvents,
+  DistributedTransactionType,
+  TransactionFlow,
   TransactionModelOptions,
   TransactionOrchestrator,
   TransactionStepsDefinition,
@@ -20,6 +23,7 @@ export class LocalWorkflow {
   protected customOptions: Partial<TransactionModelOptions> = {}
   protected workflow: WorkflowDefinition
   protected handlers: Map<string, StepHandler>
+  protected medusaContext?: Context
 
   constructor(workflowId: string) {
     const globalWorkflow = WorkflowManager.getWorkflow(workflowId)
@@ -27,10 +31,15 @@ export class LocalWorkflow {
       throw new Error(`Workflow with id "${workflowId}" not found.`)
     }
 
-    this.flow = new OrchestratorBuilder(globalWorkflow.flow_)
+    const workflow = {
+      ...globalWorkflow,
+      orchestrator: TransactionOrchestrator.clone(globalWorkflow.orchestrator),
+    }
+
+    this.flow = new OrchestratorBuilder(workflow.flow_)
     this.workflowId = workflowId
-    this.workflow = globalWorkflow
-    this.handlers = new Map(globalWorkflow.handlers_)
+    this.workflow = workflow
+    this.handlers = new Map(workflow.handlers_)
   }
 
   protected commit() {
@@ -45,7 +54,11 @@ export class LocalWorkflow {
     this.workflow = {
       id: this.workflowId,
       flow_: finalFlow,
-      orchestrator: new TransactionOrchestrator(this.workflowId, finalFlow, customOptions),
+      orchestrator: new TransactionOrchestrator({
+        id: this.workflowId,
+        definition: finalFlow,
+        options: customOptions,
+      }),
       options: customOptions,
       handler: WorkflowManager.buildHandlers(this.handlers),
       handlers_: this.handlers,
@@ -67,7 +80,7 @@ export class LocalWorkflow {
     idempotencyKey,
   }: {
     orchestrator: TransactionOrchestrator
-    transaction?: DistributedTransaction
+    transaction?: DistributedTransactionType
     subscribe?: DistributedTransactionEvents
     idempotencyKey?: string
   }) {
@@ -140,6 +153,13 @@ export class LocalWorkflow {
         )
       }
 
+      if (subscribe?.onStepAwaiting) {
+        transaction.on(
+          DistributedTransactionEvent.STEP_AWAITING,
+          eventWrapperMap.get('onStepAwaiting'),
+        )
+      }
+
       if (subscribe?.onCompensateStepSuccess) {
         transaction.on(
           DistributedTransactionEvent.COMPENSATE_STEP_SUCCESS,
@@ -151,6 +171,13 @@ export class LocalWorkflow {
         transaction.on(
           DistributedTransactionEvent.COMPENSATE_STEP_FAILURE,
           eventWrapperMap.get('onCompensateStepFailure'),
+        )
+      }
+
+      if (subscribe?.onStepSkipped) {
+        transaction.on(
+          DistributedTransactionEvent.STEP_SKIPPED,
+          eventWrapperMap.get('onStepSkipped'),
         )
       }
     }
@@ -201,15 +228,22 @@ export class LocalWorkflow {
   async run(
     uniqueTransactionId: string,
     input?: unknown,
+    context?: Context,
     subscribe?: DistributedTransactionEvents,
+    flowMetadata?: TransactionFlow['metadata'],
   ) {
     if (this.flow.hasChanges) {
       this.commit()
     }
-
+    this.medusaContext = context
     const { handler, orchestrator } = this.workflow
 
-    const transaction = await orchestrator.beginTransaction(uniqueTransactionId, handler(), input)
+    const transaction = await orchestrator.beginTransaction(
+      uniqueTransactionId,
+      handler(context),
+      input,
+      flowMetadata,
+    )
 
     const { cleanUpEventListeners } = this.registerEventCallbacks({
       orchestrator,
@@ -219,26 +253,36 @@ export class LocalWorkflow {
 
     await orchestrator.resume(transaction)
 
-    cleanUpEventListeners()
-
-    return transaction
+    try {
+      return transaction
+    } finally {
+      cleanUpEventListeners()
+    }
   }
 
-  async getRunningTransaction(uniqueTransactionId: string) {
+  async getRunningTransaction(uniqueTransactionId: string, context?: Context) {
+    this.medusaContext = context
     const { handler, orchestrator } = this.workflow
 
     const transaction = await orchestrator.retrieveExistingTransaction(
       uniqueTransactionId,
-      handler(),
+      handler(context),
     )
 
     return transaction
   }
 
-  async cancel(uniqueTransactionId: string, subscribe?: DistributedTransactionEvents) {
+  async cancel(
+    transactionOrTransactionId: string | DistributedTransactionType,
+    context?: Context,
+    subscribe?: DistributedTransactionEvents,
+  ) {
+    this.medusaContext = context
     const { orchestrator } = this.workflow
 
-    const transaction = await this.getRunningTransaction(uniqueTransactionId)
+    const transaction = isString(transactionOrTransactionId)
+      ? await this.getRunningTransaction(transactionOrTransactionId, context)
+      : transactionOrTransactionId
 
     const { cleanUpEventListeners } = this.registerEventCallbacks({
       orchestrator,
@@ -248,16 +292,20 @@ export class LocalWorkflow {
 
     await orchestrator.cancelTransaction(transaction)
 
-    cleanUpEventListeners()
-
-    return transaction
+    try {
+      return transaction
+    } finally {
+      cleanUpEventListeners()
+    }
   }
 
   async registerStepSuccess(
     idempotencyKey: string,
     response?: unknown,
+    context?: Context,
     subscribe?: DistributedTransactionEvents,
-  ): Promise<DistributedTransaction> {
+  ): Promise<DistributedTransactionType> {
+    this.medusaContext = context
     const { handler, orchestrator } = this.workflow
 
     const { cleanUpEventListeners } = this.registerEventCallbacks({
@@ -268,21 +316,25 @@ export class LocalWorkflow {
 
     const transaction = await orchestrator.registerStepSuccess(
       idempotencyKey,
-      handler(),
+      handler(context),
       undefined,
       response,
     )
 
-    cleanUpEventListeners()
-
-    return transaction
+    try {
+      return transaction
+    } finally {
+      cleanUpEventListeners()
+    }
   }
 
   async registerStepFailure(
     idempotencyKey: string,
     error?: Error | any,
+    context?: Context,
     subscribe?: DistributedTransactionEvents,
-  ): Promise<DistributedTransaction> {
+  ): Promise<DistributedTransactionType> {
+    this.medusaContext = context
     const { handler, orchestrator } = this.workflow
 
     const { cleanUpEventListeners } = this.registerEventCallbacks({
@@ -291,11 +343,17 @@ export class LocalWorkflow {
       subscribe,
     })
 
-    const transaction = await orchestrator.registerStepFailure(idempotencyKey, error, handler())
+    const transaction = await orchestrator.registerStepFailure(
+      idempotencyKey,
+      error,
+      handler(context),
+    )
 
-    cleanUpEventListeners()
-
-    return transaction
+    try {
+      return transaction
+    } finally {
+      cleanUpEventListeners()
+    }
   }
 
   setOptions(options: Partial<TransactionModelOptions>) {
